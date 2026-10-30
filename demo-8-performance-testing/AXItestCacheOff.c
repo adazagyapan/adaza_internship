@@ -1,0 +1,174 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xil_io.h"
+#include "xil_cache.h"
+#include "xil_types.h"
+#include "unistd.h"
+#include "xtime_l.h"
+
+
+#define MAX_WORDS 4194304 //16*2^20/4 16mb because its 24 bits in vhdl
+
+
+void press_enter_to_continue(void){
+    	 xil_printf("\r\nSpecify the outputs in VIO using Vivado, \r\nand then press ENTER in order to read the DDR data\r\n");
+
+    	 char c = 0;
+    	 while (c != '\r' && c != '\n'){
+    		 c = inbyte();
+    	 }
+     }
+
+uintptr_t get_address_vio(const char *which){
+	uintptr_t vio_addr = 0;
+	xil_printf("\n\rEnter the %s base address for VIO in hex\r\n", which);
+	printf("\r\n==========================\r\n");
+	scanf("%lx", (unsigned long *)&vio_addr);
+	printf("%s address Received: 0x%08lX\r\n",which, (unsigned long)vio_addr);
+	return vio_addr;
+}
+
+u32 get_word_count(const char *which) {
+	u32 words = 0;
+	xil_printf("\n\rEnter the number of words for %s in decimal\r\n", which);
+	scanf("%u", (unsigned int *)&words);
+	printf("%s word count received: %u (%u bytes)\r\n", which, words, words*4);
+	return words;
+}
+
+int write_test(volatile u32 *p, uintptr_t base) {
+	const u32 pattern = 0xA5A5A5A5;
+
+	u32 saved = p[0]; //keep whatever is already there
+	p[0] = pattern; //write a known value
+	u32 readback = p[0]; // read the written known value
+	p[0] = saved; // restore back original contents
+
+	if (readback==pattern) {
+		printf("Write test successful at 0x%08lX\r\n", base);
+		return 1;
+	}
+	else{
+		printf("Write test failed at 0x%08lX (wrote 0x%08X, read 0x%08X)", base, pattern, readback);
+		return 0;
+	}
+}
+
+int main()
+
+{
+    init_platform();
+    Xil_DCacheDisable(); // so that we do not need to flush or invalidate the cache
+
+    const uintptr_t write_base = get_address_vio("write");
+    const uintptr_t read_base = get_address_vio("read");
+    const u32 word_count_wr = get_word_count("write");
+    const u32 word_count_rd = get_word_count("read");
+
+    if (word_count_wr == 0 || word_count_wr > MAX_WORDS) {
+    	printf("Word count out of range");
+    	cleanup_platform();
+    	return -1;
+    }
+    if (word_count_rd == 0 || word_count_rd > MAX_WORDS) {
+    	printf("Word count out of range");
+    	cleanup_platform();
+    	return -1;
+    }
+
+    volatile u32 *ddr_ptr = (volatile u32 *)write_base;
+
+    if (!write_test(ddr_ptr, write_base)) {
+    	printf("Region is not writable\r\n");
+    	cleanup_platform();
+    	return -1;
+    }
+
+    else {
+
+    	volatile u32 *wr = (volatile u32 *)write_base;
+    	volatile u32 *rd = (volatile u32 *)read_base;
+
+    	for (int i = 0; i<word_count_wr; i++){
+    		wr[i] = 0x00000000;
+    	}
+
+
+		xil_printf("\r\n%d bytes at 0x%lX cleared\r\n", word_count_wr * 4, (unsigned long) write_base);
+
+		for (int i = 0; i<word_count_rd; i++){
+		    		u32 test_data = 0xDEADBEEF;
+		    		rd[i] = test_data;
+		}
+
+		xil_printf("\r\n%d bytes at 0x%lX DEADBEEFed\r\n", word_count_rd * 4, (unsigned long) read_base);
+
+		press_enter_to_continue();
+
+
+//		xil_printf("\r\n==========================\r\n");
+//		xil_printf("PL to PS DDR Data Verification Read\r\n");
+//		xil_printf("===============================\r\n");
+//
+//
+//
+//		for (int i = 0; i < word_count_wr; i++) {
+//			printf("Address[0x%08lX]: ddr_ptr[%d]: Hex[0x%08X] : Decimal[%d]\r\n", (unsigned long)(write_base + i*4), i, wr[i], wr[i]);
+//		}
+
+		xil_printf("\r\n--- PS DDR Read is Completed ---\r\n");
+
+
+
+		// CPU performance (cache off in ts case)
+		// CPU counterpart of the PL transfer timed with ARM generic timer
+		// PL numbers come from VIO
+		// PL time = cycles/96,968,727 PL0 clock freq
+
+		u32 n_words = word_count_wr;
+		u32 n_bytes = n_words * 4;
+
+		// some typa buffer LOOK INTO THIS TOMORROW!!!!!!
+		u32 *src = (u32 *)malloc(n_bytes);
+		u32 *dst = (u32*)malloc(n_bytes);
+		if (src== NULL || dst == NULL) {
+			printf("malloc failed (increase heap size in the linker script)\r\n");
+			free(src);
+			free(dst);
+			cleanup_platform();
+		}
+
+		// fill the source (ts is not timed)
+		for (u32 i = 0; i<n_words; i++){
+			src[i] = i;
+		}
+
+		XTime t0, t1;
+
+		// CPU memcpy
+		XTime_GetTime(&t0);
+		memcpy(dst, src, n_bytes);
+		XTime_GetTime(&t1);
+		u64 counts = (u64)(t1-t0);
+		if (counts == 0) {
+			counts = 1;
+		}
+
+		printf("\r\n=== CPU memcpy performance ===\r\n");
+		printf("timer tick rate: %llu Hz\r\n", (u64)COUNTS_PER_SECOND);
+		printf("N delivered: %u bytes\r\n", n_bytes);
+		printf("CPU throughput: %llu counts, %llu MB/s\r\n", counts, (u64)n_bytes*COUNTS_PER_SECOND/counts/1000000ULL);
+		free(src);
+		free(dst);
+
+
+		cleanup_platform();
+		return 0;
+    }
+}
+
+
